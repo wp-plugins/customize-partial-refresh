@@ -57,6 +57,7 @@ class WP_Customize_Partial_Refresh_Widgets {
 			return;
 		}
 		add_filter( 'widget_customizer_setting_args', array( $this, 'filter_widget_customizer_setting_args' ), 10, 2 );
+		add_action( 'customize_controls_enqueue_scripts', array( $this, 'customize_controls_enqueue_scripts' ) );
 		add_action( 'customize_preview_init', array( $this, 'customize_preview_init' ) );
 	}
 
@@ -195,6 +196,29 @@ class WP_Customize_Partial_Refresh_Widgets {
 	}
 
 	/**
+	 * Add scripts for customizing the Customizer pane
+	 */
+	function customize_controls_enqueue_scripts() {
+		/**
+		 * @var WP_Scripts $wp_scripts
+		 */
+		global $wp_scripts;
+
+		wp_enqueue_script( $this->plugin->script_handles['widgets-pane'] );
+
+		// Why not wp_localize_script? Because we're not localizing, and it forces values into strings
+		$exports = array(
+			'sidebarsEligibleForPostMessage' => $this->get_sidebars_supporting_partial_refresh(),
+			'widgetsEligibleForPostMessage' => $this->get_widgets_supporting_partial_refresh(),
+		);
+		$wp_scripts->add_data(
+			$this->plugin->script_handles['widgets-pane'],
+			'data',
+			sprintf( 'var _wpCustomizePartialRefreshWidgets_exports = %s;', json_encode( $exports ) )
+		);
+	}
+
+	/**
 	 * @action wp_enqueue_scripts
 	 */
 	function customize_preview_enqueue_deps() {
@@ -202,18 +226,10 @@ class WP_Customize_Partial_Refresh_Widgets {
 		 * @var WP_Customize_Manager $wp_customize
 		 * @var WP_Scripts $wp_scripts
 		 */
-		global $wp_registered_sidebars, $wp_customize, $wp_scripts;
+		global $wp_customize, $wp_scripts;
 
-		$script_handle = 'customize-partial-refresh-widgets-preview';
-		$src = $this->plugin->get_dir_url( 'js/customize-partial-refresh-widgets-preview.js' );
-		$deps = array( 'jquery', 'wp-util', 'customize-preview' );
-		$in_footer = true;
-		wp_enqueue_script( $script_handle, $src, $deps, $this->plugin->get_version(), $in_footer );
-
-		$style_handle = 'customize-partial-refresh-widgets-preview';
-		$src = $this->plugin->get_dir_url( 'css/customize-partial-refresh-widgets-preview.css' );
-		$deps = array();
-		wp_enqueue_style( $style_handle, $src, $deps, $this->plugin->get_version() );
+		wp_enqueue_script( $this->plugin->script_handles['widgets-preview'] );
+		wp_enqueue_style( $this->plugin->style_handles['widgets-preview'] );
 
 		// Enqueue any scripts provided to add live preview support for builtin themes (e.g. twentythirteen)
 		$applied_themes = array( get_template() );
@@ -232,19 +248,25 @@ class WP_Customize_Partial_Refresh_Widgets {
 
 		// Why not wp_localize_script? Because we're not localizing, and it forces values into strings
 		$exports = array(
-			'registered_sidebars' => $wp_registered_sidebars,
-			'render_widget_query_var' => self::RENDER_WIDGET_QUERY_VAR,
-			'render_widget_nonce_value' => wp_create_nonce( self::RENDER_WIDGET_AJAX_ACTION ),
-			'render_widget_nonce_post_key' => self::RENDER_WIDGET_NONCE_POST_KEY,
-			'request_uri' => ! empty( $_SERVER['REQUEST_URI'] ) ? wp_unslash( esc_url_raw( $_SERVER['REQUEST_URI'] ) ) : '/',
-			'sidebars_eligible_for_post_message' => $this->get_sidebars_supporting_partial_refresh(),
-			'widgets_eligible_for_post_message' => $this->get_widgets_supporting_partial_refresh(),
-			'preview_customize_nonce' => wp_create_nonce( 'preview-customize_' . $wp_customize->get_stylesheet() ),
+			'renderWidgetQueryVar' => self::RENDER_WIDGET_QUERY_VAR,
+			'renderWidgetNonceValue' => wp_create_nonce( self::RENDER_WIDGET_AJAX_ACTION ),
+			'renderWidgetNoncePostKey' => self::RENDER_WIDGET_NONCE_POST_KEY,
+			'requestUri' => '/',
+			'sidebarsEligibleForPostMessage' => $this->get_sidebars_supporting_partial_refresh(),
+			'widgetsEligibleForPostMessage' => $this->get_widgets_supporting_partial_refresh(),
+			'theme' => array(
+				'stylesheet' => $wp_customize->get_stylesheet(),
+				'active'     => $wp_customize->is_theme_active(),
+			),
+			'previewCustomizeNonce' => wp_create_nonce( 'preview-customize_' . $wp_customize->get_stylesheet() ),
 		);
+		if ( ! empty( $_SERVER['REQUEST_URI'] ) ) {
+			$exports['requestUri'] = esc_url_raw( home_url( wp_unslash( $_SERVER['REQUEST_URI'] ) ) );
+		}
 		$wp_scripts->add_data(
-			$script_handle,
+			$this->plugin->script_handles['widgets-preview'],
 			'data',
-			sprintf( 'var _wpCustomizePartialRefreshWidgets_exports = %s;', json_encode( $exports ) )
+			sprintf( 'var _wpCustomizePartialRefreshWidgets_exports = %s;', wp_json_encode( $exports ) )
 		);
 	}
 
@@ -282,49 +304,65 @@ class WP_Customize_Partial_Refresh_Widgets {
 				throw new WP_Customize_Partial_Refresh_Exception( __( 'Missing widget_id param', 'customize-partial-preview-refresh' ) );
 			}
 			$widget_id = wp_unslash( sanitize_text_field( $_POST['widget_id'] ) ); // wpcs: input var okay; sanitize_text_field for WordPress-VIP
-			if ( ! isset( $wp_registered_widgets[ $widget_id ] ) ) {
+			if ( ! array_key_exists( $widget_id, $wp_registered_widgets ) ) {
 				throw new WP_Customize_Partial_Refresh_Exception( __( 'Unable to find registered widget', 'customize-partial-preview-refresh' ) );
 			}
 			$widget = $wp_registered_widgets[ $widget_id ];
 
-			$rendered_widget = null;
-			$sidebar_id = is_active_widget( $widget['callback'], $widget['id'], false, false );
-
-			if ( $sidebar_id ) {
-				$sidebar = $wp_registered_sidebars[ $sidebar_id ];
-				$widget_name = $widget['name'];
-				$params = array_merge(
-					array( array_merge( $sidebar, compact( 'widget_id', 'widget_name' ) ) ),
-					(array) $widget['params']
-				);
-
-				$callback = $widget['callback'];
-				if ( ! is_array( $callback ) || ! ( $callback[0] instanceof WP_Widget ) ) {
-					throw new WP_Customize_Partial_Refresh_Exception( __( 'Only Widgets 2.0 are supported. Old single widgets are not.', 'customize-partial-preview-refresh' ) );
-				}
-
-				// Substitute HTML id and class attributes into before_widget
-				$class_name = '';
-				foreach ( (array) $widget['classname'] as $cn ) {
-					if ( is_string( $cn ) ) {
-						$class_name .= '_' . $cn;
-					} else if ( is_object( $cn ) ) {
-						$class_name .= '_' . get_class( $cn );
-					}
-				}
-				$class_name = ltrim( $class_name, '_' );
-
-				$params[0]['before_widget'] = sprintf( $params[0]['before_widget'], $widget_id, $class_name );
-				$params = apply_filters( 'dynamic_sidebar_params', $params );
-
-				// Render the widget
-				ob_start();
-				do_action( 'dynamic_sidebar', $widget );
-				if ( is_callable( $callback ) ) {
-					call_user_func_array( $callback, $params );
-				}
-				$rendered_widget = ob_get_clean();
+			if ( ! array_key_exists( 'sidebar_id', $_POST ) ) { // wpcs: input var okay
+				throw new WP_Customize_Partial_Refresh_Exception( __( 'Missing sidebar_id param', 'customize-partial-preview-refresh' ) );
 			}
+			$sidebar_id = wp_unslash( sanitize_text_field( $_POST['sidebar_id'] ) ); // wpcs: input var okay; sanitize_text_field for WordPress-VIP
+			$sidebar = array();
+			if ( array_key_exists( $sidebar_id, $wp_registered_sidebars ) ) {
+				$sidebar = $wp_registered_sidebars[ $sidebar_id ];
+			}
+
+			/**
+			 * Allow plugins to override the sidebar args.
+			 *
+			 * @param array $sidebar
+			 * @param string $sidebar_id
+			 */
+			$sidebar = apply_filters( 'customize_partial_refresh_sidebar_args', $sidebar, $sidebar_id );
+			if ( empty( $sidebar ) ) {
+				throw new WP_Customize_Partial_Refresh_Exception( sprintf( __( 'Attempted to render widget %1$s onto unknown sidebar %2$s.', 'customize-partial-preview-refresh' ), $widget_id, $sidebar_id ) );
+			}
+
+			$rendered_widget = null;
+			$sidebar = $wp_registered_sidebars[ $sidebar_id ];
+			$widget_name = $widget['name'];
+			$params = array_merge(
+				array( array_merge( $sidebar, compact( 'widget_id', 'widget_name' ) ) ),
+				(array) $widget['params']
+			);
+
+			$callback = $widget['callback'];
+			if ( ! is_array( $callback ) || ! ( $callback[0] instanceof WP_Widget ) ) {
+				throw new WP_Customize_Partial_Refresh_Exception( __( 'Only Widgets 2.0 are supported. Old single widgets are not.', 'customize-partial-preview-refresh' ) );
+			}
+
+			// Substitute HTML id and class attributes into before_widget
+			$class_name = '';
+			foreach ( (array) $widget['classname'] as $cn ) {
+				if ( is_string( $cn ) ) {
+					$class_name .= '_' . $cn;
+				} else if ( is_object( $cn ) ) {
+					$class_name .= '_' . get_class( $cn );
+				}
+			}
+			$class_name = ltrim( $class_name, '_' );
+
+			$params[0]['before_widget'] = sprintf( $params[0]['before_widget'], $widget_id, $class_name );
+			$params = apply_filters( 'dynamic_sidebar_params', $params );
+
+			// Render the widget
+			ob_start();
+			do_action( 'dynamic_sidebar', $widget );
+			if ( is_callable( $callback ) ) {
+				call_user_func_array( $callback, $params );
+			}
+			$rendered_widget = ob_get_clean();
 			wp_send_json_success( compact( 'rendered_widget', 'sidebar_id' ) );
 		}
 		catch ( Exception $e ) {

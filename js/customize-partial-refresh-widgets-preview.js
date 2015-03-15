@@ -1,38 +1,142 @@
-/*global jQuery, _wpCustomizePartialRefreshWidgets_exports, _ */
+/*global jQuery, JSON, _wpCustomizePartialRefreshWidgets_exports, _ */
 wp.customize.partialPreviewWidgets = ( function ( $ ) {
 	'use strict';
+	var self, oldWidgetsInit;
 
-	var self = {
-		sidebars_eligible_for_post_message: [],
-		widgets_eligible_for_post_message: [],
-		render_widget_query_var: null,
-		render_widget_nonce_value: null,
-		render_widget_nonce_post_key: null,
-		preview_customize_nonce: null
+	self = {
+		sidebarsEligibleForPostMessage: [],
+		widgetsEligibleForPostMessage: [],
+		renderWidgetQueryVar: null,
+		renderWidgetNonceValue: null,
+		renderWidgetNoncePostKey: null,
+		previewCustomizeNonce: null,
+		previewReady: $.Deferred(),
+		registeredSidebars: {},
+		requestUri: '/',
+		theme: {
+			active: false,
+			stylesheet: ''
+		}
 	};
+
+	wp.customize.bind( 'preview-ready', function () {
+		self.previewReady.resolve();
+	} );
 
 	$.extend( self, _wpCustomizePartialRefreshWidgets_exports );
 
+	// Wrap the WidgetCustomizerPreview.init so that our init is executed immediately afterward
+	oldWidgetsInit = wp.customize.WidgetCustomizerPreview.init;
+	wp.customize.WidgetCustomizerPreview.init = function () {
+		oldWidgetsInit.apply( wp.customize.WidgetCustomizerPreview, arguments );
+		self.init();
+	};
+
+	self.SettingTransportProxy = wp.customize.Value.extend({
+		initialize: function( id, transport, options ) {
+			wp.customize.Value.prototype.initialize.call( this, transport, options );
+			this.id = id;
+
+			// Sync the new transport to the parent
+			this.bind( 'change', function ( newTransport ) {
+				wp.customize.preview.send( 'update-setting', {
+					id: this.id,
+					transport: newTransport
+				} );
+			} );
+		}
+	});
+
+	self.settingTransports = new wp.customize.Values({
+		defaultConstructor: self.SettingTransportProxy,
+		get: function ( id ) {
+			if ( this.has( id ) ) {
+				return this( id ).get();
+			} else {
+				return null;
+			}
+		},
+		set: function ( id, value ) {
+			if ( ! this.has( id ) ) {
+				return this.create( id, id, value );
+			} else {
+				return this( id ).set( value );
+			}
+		}
+	});
+
+	/**
+	 * Bootstrap functionality.
+	 */
 	self.init = function () {
+		var self = this;
 		self.preview = wp.customize.WidgetCustomizerPreview.preview;
-		this.livePreview();
+
+		// Improve lookup of registered sidebars via map of sidebar ID to sidebar object
+		_.each( wp.customize.WidgetCustomizerPreview.registeredSidebars, function ( sidebar ) {
+			self.registeredSidebars[ sidebar.id ] = sidebar;
+		} );
+
+		self.previewReady.done( function () {
+			wp.customize.preview.bind( 'active', function () {
+				self.requestSettingTransports();
+			} );
+			wp.customize.preview.bind( 'setting-transports', function ( transports ) {
+				$.each( transports, function ( settingId, transport ) {
+					self.settingTransports.set( settingId, transport );
+				} );
+				self.settingTransports.trigger( 'updated' );
+			} );
+
+			// Currently customize-preview.js is not creating settings for dynamically-created settings in the pane; so we have to do it
+			wp.customize.preview.bind( 'setting', function( args ) {
+				var id, value;
+				args = args.slice();
+				id = args.shift();
+				value = args.shift();
+				if ( ! wp.customize.has( id ) ) {
+					wp.customize.create( id, value ); // @todo This should be in core
+				}
+			});
+
+			self.livePreview();
+		} );
+	};
+
+	/**
+	 * Send message to pane requesting all setting transports.
+	 *
+	 * Returned promise is resolved once the parent window sends back the message.
+	 *
+	 * @returns {jQuery.Deferred}
+	 */
+	self.requestSettingTransports = function () {
+		var promise, once;
+		promise = $.Deferred();
+		once = function () {
+			self.settingTransports.unbind( 'updated', once );
+			promise.resolveWith( self.settingTransports );
+		};
+		self.settingTransports.bind( 'updated', once );
+		wp.customize.preview.send( 'request-setting-transports' );
+		return promise;
 	};
 
 	/**
 	 * if the containing sidebar is eligible, and if there are sibling widgets the sidebar currently rendered
-	 * @param {String} sidebar_id
+	 * @param {String} sidebarId
 	 * @return {Boolean}
 	 */
-	self.sidebarCanLivePreview = function ( sidebar_id ) {
-		var widget_ids, rendered_widget_ids;
-		if ( -1 === self.sidebars_eligible_for_post_message.indexOf( sidebar_id ) ) {
+	self.sidebarCanLivePreview = function ( sidebarId ) {
+		var widgetIds, renderedWidgetIds;
+		if ( -1 === self.sidebarsEligibleForPostMessage.indexOf( sidebarId ) ) {
 			return false;
 		}
-		widget_ids = wp.customize( self.sidebar_id_to_setting_id( sidebar_id ) )();
-		rendered_widget_ids = _( widget_ids ).filter( function ( widget_id ) {
-			return 0 !== $( '#' + widget_id ).length;
+		widgetIds = wp.customize( wp.customize.Widgets.sidebarIdToSettingId( sidebarId ) )();
+		renderedWidgetIds = _( widgetIds ).filter( function ( widgetId ) {
+			return 0 !== $( '#' + widgetId ).length;
 		} );
-		return ( rendered_widget_ids.length !== 0 );
+		return ( renderedWidgetIds.length !== 0 );
 	};
 
 	/**
@@ -40,217 +144,70 @@ wp.customize.partialPreviewWidgets = ( function ( $ ) {
 	 * preview tell us, so this updates the parent's transports to
 	 * postMessage when it is available. If there is a switch from
 	 * postMessage to refresh, the preview window will request a refresh.
+	 *
+	 * @returns {jQuery.Deferred}
 	 */
 	self.refreshTransports = function () {
-		var changed_to_refresh = false;
-		$.each( _.keys( wp.customize.WidgetCustomizerPreview.renderedSidebars ), function ( i, sidebar_id ) {
-			var setting_id, setting, sidebar_transport, widget_ids;
+		var promise;
 
-			setting_id = self.sidebar_id_to_setting_id( sidebar_id );
-			setting = parent.wp.customize( setting_id ); // @todo Eliminate use of parent by sending messages
-			sidebar_transport = self.sidebarCanLivePreview( sidebar_id ) ? 'postMessage' : 'refresh';
-			if ( 'refresh' === sidebar_transport && 'postMessage' === setting.transport ) {
-				changed_to_refresh = true;
-			}
-			setting.transport = sidebar_transport;
+		promise = self.requestSettingTransports();
 
-			widget_ids = wp.customize( setting_id )();
-			$.each( widget_ids, function ( i, widget_id ){
-				var setting_id, setting, widget_transport, id_base;
-				setting_id = self.widget_id_to_setting_id( widget_id );
-				setting = parent.wp.customize( setting_id ); // @todo Eliminate use of parent by sending messages
-				widget_transport = 'refresh';
-				id_base = self.widget_id_to_base( widget_id );
-				if ( sidebar_transport === 'postMessage' && ( -1 !== self.widgets_eligible_for_post_message.indexOf( id_base ) ) ) {
-					widget_transport = 'postMessage';
+		promise.done( function () {
+			var settingTransports = this, changedToRefresh = false;
+			$.each( _.keys( wp.customize.WidgetCustomizerPreview.renderedSidebars ), function ( i, sidebarId ) {
+				var settingId, sidebarTransport, widgetIds;
+
+				settingId = wp.customize.Widgets.sidebarIdToSettingId( sidebarId );
+				sidebarTransport = self.sidebarCanLivePreview( sidebarId ) ? 'postMessage' : 'refresh';
+				if ( 'refresh' === sidebarTransport && 'postMessage' === settingTransports.get( settingId ) ) {
+					changedToRefresh = true;
 				}
-				if ( 'refresh' === widget_transport && 'postMessage' === setting.transport ) {
-					changed_to_refresh = true;
-				}
-				setting.transport = widget_transport;
+				settingTransports.set( settingId, sidebarTransport );
+
+				widgetIds = wp.customize( settingId ).get();
+				$.each( widgetIds, function ( i, widgetId ){
+					var settingId, widgetTransport, idBase;
+					settingId = wp.customize.Widgets.widgetIdToSettingId( widgetId );
+
+					widgetTransport = 'refresh';
+					idBase = wp.customize.Widgets.parseWidgetId( widgetId ).idBase;
+					if ( sidebarTransport === 'postMessage' && ( -1 !== _.indexOf( self.widgetsEligibleForPostMessage, idBase ) ) ) {
+						widgetTransport = 'postMessage';
+					}
+					if ( 'refresh' === widgetTransport && 'postMessage' === settingTransports.get( settingId ) ) {
+						changedToRefresh = true;
+					}
+					settingTransports.set( settingId, widgetTransport );
+				} );
 			} );
+			if ( changedToRefresh ) {
+				self.preview.send( 'refresh' );
+			}
 		} );
-		if ( changed_to_refresh ) {
-			self.preview.send( 'refresh' );
-		}
+
+		return promise;
 	};
 
 	/**
-	 *
+	 * Set up widget and sidebar settings to be live-previewed if eligible.
 	 */
 	self.livePreview = function () {
-		var already_bound_widgets, bind_widget_setting;
-
-		already_bound_widgets = {};
-
-		bind_widget_setting = function( widget_id ) {
-			var setting_id, binder;
-
-			setting_id = self.widget_id_to_setting_id( widget_id );
-			binder = function( value ) {
-				var update_count;
-
-				already_bound_widgets[ widget_id ] = true;
-				update_count = 0;
-				value.bind( function( to, from ) {
-					var widget_setting_id, sidebar_id, sidebar_widgets, data, customized;
-
-					// Workaround for http://core.trac.wordpress.org/ticket/26061;
-					// once fixed, eliminate initial_value, update_count, and this conditional
-					update_count += 1;
-					if ( 1 === update_count && _.isEqual( from, to ) ) {
-						return;
-					}
-
-					widget_setting_id = self.widget_id_to_setting_id( widget_id );
-					if ( parent.wp.customize( widget_setting_id ).transport !== 'postMessage' ) { // @todo Eliminate use of parent by sending messages
-						return;
-					}
-
-					sidebar_id = null;
-					sidebar_widgets = [];
-					wp.customize.each( function ( setting, setting_id ) {
-						var matches = setting_id.match( /^sidebars_widgets\[(.+)\]/ );
-						if ( matches && setting().indexOf( widget_id ) !== -1 ) {
-							sidebar_id = matches[1];
-							sidebar_widgets = setting();
-						}
-					} );
-					if ( ! sidebar_id ) {
-						throw new Error( 'Widget does not exist in a sidebar.' );
-					}
-					data = {
-						widget_id: widget_id,
-						nonce: self.preview_customize_nonce, // for Customize Preview
-						wp_customize: 'on'
-					};
-					data[ self.render_widget_query_var ] = '1';
-					customized = {};
-					customized[ self.sidebar_id_to_setting_id( sidebar_id ) ] = sidebar_widgets;
-					customized[ setting_id ] = to;
-					data.customized = JSON.stringify( customized );
-					data[ self.render_widget_nonce_post_key ] = self.render_widget_nonce_value;
-
-					$( '#' + widget_id ).addClass( 'customize-partial-refreshing' );
-
-					$.post( self.request_uri, data, function ( r ) {
-						if ( ! r.success ) {
-							throw new Error( r.data && r.data.message ? r.data.message : 'FAIL' );
-						}
-						var old_widget, new_widget, sidebar_widgets, position, before_widget, after_widget;
-
-						// @todo Fire jQuery event to indicate that a widget was updated; here widgets can re-initialize them if they support live widgets
-						old_widget = $( '#' + widget_id );
-						new_widget = $( r.data.rendered_widget );
-						if ( new_widget.length && old_widget.length ) {
-							old_widget.replaceWith( new_widget );
-						} else if ( ! new_widget.length && old_widget.length ) {
-							old_widget.remove();
-						} else if ( new_widget.length && ! old_widget.length ) {
-							sidebar_widgets = wp.customize( self.sidebar_id_to_setting_id( r.data.sidebar_id ) )();
-							position = sidebar_widgets.indexOf( widget_id );
-							if ( -1 === position ) {
-								throw new Error( 'Unable to determine new widget position in sidebar' );
-							}
-							if ( sidebar_widgets.length === 1 ) {
-								throw new Error( 'Unexpected postMessage for adding first widget to sidebar; refresh must be used instead.' );
-							}
-							if ( position > 0 ) {
-								before_widget = $( '#' + sidebar_widgets[ position - 1 ] );
-								before_widget.after( new_widget );
-							}
-							else {
-								after_widget = $( '#' + sidebar_widgets[ position + 1 ] );
-								after_widget.before( new_widget );
-							}
-						}
-						self.preview.send( 'widget-updated', widget_id );
-						wp.customize.trigger( 'sidebar-updated', sidebar_id );
-						wp.customize.trigger( 'widget-updated', widget_id );
-
-						parent.wp.customize.control( setting_id ).active( 0 !== new_widget.length ); // @todo Eliminate use of parent by sending messages
-						self.refreshTransports();
-					} );
-				} );
-			};
-			wp.customize( setting_id, binder );
-			already_bound_widgets[setting_id] = binder;
-		};
-
-		$.each( _.keys( wp.customize.WidgetCustomizerPreview.renderedSidebars ), function ( i, sidebar_id ) {
-			var setting_id = self.sidebar_id_to_setting_id( sidebar_id );
-			wp.customize( setting_id, function( value ) {
-				var update_count = 0;
-				value.bind( function( to, from ) {
-					// Workaround for http://core.trac.wordpress.org/ticket/26061;
-					// once fixed, eliminate initial_value, update_count, and this conditional
-					update_count += 1;
-					if ( 1 === update_count && _.isEqual( from, to ) ) {
-						return;
-					}
-
-					// Sort widgets
-					// @todo instead of appending to the parent, we should append relative to the first widget found
-					$.each( to, function ( i, widget_id ) {
-						var widget = $( '#' + widget_id );
-						widget.parent().append( widget );
-					} );
-
-					// Create settings for newly-created widgets
-					$.each( to, function ( i, widget_id ) {
-						var setting_id, setting, parent_setting;
-
-						setting_id = self.widget_id_to_setting_id( widget_id );
-						setting = wp.customize( setting_id );
-						if ( ! setting ) {
-							setting = wp.customize.create( setting_id, {} );
-						}
-
-						// @todo Is there another way to check if we bound?
-						if ( ! already_bound_widgets[widget_id] ) {
-							bind_widget_setting( widget_id );
-						}
-
-						// Force the callback to fire if this widget is newly-added
-						if ( from.indexOf( widget_id ) === -1 ) {
-							self.refreshTransports();
-							parent_setting = parent.wp.customize( setting_id );
-							if ( 'postMessage' === parent_setting.transport ) {
-								setting.callbacks.fireWith( setting, [ setting(), null ] );
-							} else {
-								self.preview.send( 'refresh' );
-							}
-						}
-					} );
-
-					// Remove widgets (their DOM element and their setting) when removed from sidebar
-					$.each( from, function ( i, old_widget_id ) {
-						if ( -1 === to.indexOf( old_widget_id ) ) {
-							var setting_id = self.widget_id_to_setting_id( old_widget_id );
-							if ( wp.customize.has( setting_id ) ) {
-								wp.customize.remove( setting_id );
-								// @todo WARNING: If a widget is moved to another sidebar, we need to either not do this, or force a refresh when a widget is  moved to another sidebar
-							}
-							$( '#' + old_widget_id ).remove();
-						}
-					} );
-
-					// If a widget was removed so that no widgets remain rendered in sidebar, we need to disable postMessage
-					self.refreshTransports();
-					wp.customize.trigger( 'sidebar-updated', sidebar_id );
-				} );
+		$.each( _.keys( wp.customize.WidgetCustomizerPreview.renderedSidebars ), function ( i, sidebarId ) {
+			var settingId = wp.customize.Widgets.sidebarIdToSettingId( sidebarId );
+			wp.customize( settingId, function( setting ) {
+				setting.id = settingId;
+				setting.sidebarId = sidebarId;
+				setting.bind( self.onChangeSidebarSetting );
 			} );
 		} );
 
-		$.each( wp.customize.WidgetCustomizerPreview.renderedWidgets, function ( widget_id ) {
-			var setting_id = self.widget_id_to_setting_id( widget_id );
-			if ( ! wp.customize.has( setting_id ) ) {
-				// Used to have to do this: wp.customize.create( setting_id, instance );
-				// Now that the settings are registered at the `wp` action, it is late enough
-				// for all filters to be added, e.g. sidebars_widgets for Widget Visibility
-				throw new Error( 'Expected customize to have registered setting for widget ' + widget_id );
-			}
-			bind_widget_setting( widget_id );
+		$.each( wp.customize.WidgetCustomizerPreview.renderedWidgets, function ( widgetId ) {
+			var settingId = wp.customize.Widgets.widgetIdToSettingId( widgetId );
+			wp.customize( settingId, function ( setting ) {
+				setting.id = settingId;
+				setting.widgetId = widgetId;
+				setting.bind( self.onChangeWidgetSetting );
+			} );
 		} );
 
 		// Opt-in to LivePreview
@@ -258,40 +215,201 @@ wp.customize.partialPreviewWidgets = ( function ( $ ) {
 	};
 
 	/**
-	 * @param {String} widget_id
-	 * @returns {String}
+	 * Callback for a change to a sidebars_widgets[x] setting.
+	 *
+	 * @this {wp.customize.Setting}
+	 * @param {array} newSidebarWidgetIds
+	 * @param {array} oldSidebarWidgetIds
 	 */
-	self.widget_id_to_setting_id = function ( widget_id ) {
-		var setting_id, matches;
-		setting_id = null;
-		matches = widget_id.match(/^(.+?)(?:-(\d+)?)$/);
-		if ( matches ) {
-			setting_id = 'widget_' + matches[1] + '[' + matches[2] + ']';
-		} else {
-			setting_id = 'widget_' + widget_id;
+	self.onChangeSidebarSetting = function( newSidebarWidgetIds, oldSidebarWidgetIds ) {
+		var setting = this;
+
+		// Sort widgets
+		// @todo instead of appending to the parent, we should append relative to the first widget found
+		$.each( newSidebarWidgetIds, function ( i, widgetId ) {
+			var widget = $( '#' + widgetId );
+			widget.parent().append( widget );
+			// @todo if a widget does not support partial-refresh, then this should technically trigger a refresh
+			// @todo widget.trigger( 'customize-widget-sorted' ) so that a widget can re-initialize any dynamic iframe content
+		} );
+
+		// Trigger insertions for newly-added widgets
+		$.each( newSidebarWidgetIds, function ( i, widgetId ) {
+			var widgetSettingId;
+
+			// Skip a widget that was previously rendered
+			if ( wp.customize.WidgetCustomizerPreview.renderedWidgets[ widgetId ] ) {
+				return;
+			}
+
+			widgetSettingId = wp.customize.Widgets.widgetIdToSettingId( widgetId );
+			wp.customize( widgetSettingId, function ( widgetSetting ) {
+				widgetSetting.id = widgetSettingId; // @todo this should be be in core
+				widgetSetting.widgetId = widgetId;
+				self.handleWidgetInsert( widgetSetting );
+			} );
+		} );
+
+		// Remove widgets (their DOM element and their setting) when removed from sidebar
+		$.each( oldSidebarWidgetIds, function ( i, oldWidgetId ) {
+			var settingId, setting;
+			// Abort if the old widget still exists in the new sidebar
+			if ( -1 !== _.indexOf( newSidebarWidgetIds, oldWidgetId ) ) {
+				return;
+			}
+			delete wp.customize.WidgetCustomizerPreview.renderedWidgets[ oldWidgetId ];
+			settingId = wp.customize.Widgets.widgetIdToSettingId( oldWidgetId );
+			setting = wp.customize( settingId );
+			if ( setting ) {
+				setting.unbind( self.onChangeWidgetSetting );
+				wp.customize.remove( settingId );
+				// @todo WARNING: If a widget is moved to another sidebar, we need to either not do this, or force a refresh when a widget is  moved to another sidebar
+			}
+			$( '#' + oldWidgetId ).remove();
+		} );
+
+		// If a widget was removed so that no widgets remain rendered in sidebar, we need to disable postMessage
+		self.refreshTransports();
+		wp.customize.trigger( 'sidebar-updated', setting.sidebarId );
+	};
+
+	/**
+	 * Handle inserting a widget setting into the document.
+	 *
+	 * @param {wp.customize.Setting} widgetSetting
+	 * @param {string} widgetSetting.widgetId
+	 * @returns {boolean} true if the widget is indeed to be inserted
+	 */
+	self.handleWidgetInsert = function ( widgetSetting ) {
+		if ( ! widgetSetting.widgetId ) {
+			throw new Error( 'Attempted to call on a non-widget setting.' );
 		}
-		return setting_id;
+
+		// Skip widget if it is already rendered
+		if ( wp.customize.WidgetCustomizerPreview.renderedWidgets[ widgetSetting.widgetId ] ) {
+			return false;
+		}
+
+		wp.customize.WidgetCustomizerPreview.renderedWidgets[ widgetSetting.widgetId ] = true;
+		widgetSetting.bind( self.onChangeWidgetSetting ); // ideally core would have jQuery.Callbacks have the unique flag set
+
+		self.requestSettingTransports().done( function () {
+			var settingTransports = this;
+			if ( 'postMessage' === settingTransports( widgetSetting.id ).get() ) {
+				self.onChangeWidgetSetting.call( widgetSetting, widgetSetting.get(), null );
+			} else {
+				self.preview.send( 'refresh' );
+			}
+		} );
+		return true;
 	};
 
 	/**
-	 * @param {String} widget_id
-	 * @returns {String}
+	 * Callback for change to a widget_x[y] setting.
+	 *
+	 * @this {wp.customize.Setting}
+	 * @param newInstance
 	 */
-	self.widget_id_to_base = function ( widget_id ) {
-		return widget_id.replace( /-\d+$/, '' );
-	};
+	self.onChangeWidgetSetting = function( newInstance ) {
+		var setting, sidebarId, sidebarWidgets, data, customized, event;
 
-	/**
-	 * @param {String} sidebar_id
-	 * @returns {string}
-	 */
-	self.sidebar_id_to_setting_id = function ( sidebar_id ) {
-		return 'sidebars_widgets[' + sidebar_id + ']';
-	};
+		setting = this;
+		if ( ! setting.widgetId ) {
+			throw new Error( 'The setting ' + setting.id + ' does not look like a widget instance setting.' );
+		}
 
-	$( function () {
-		self.init();
-	} );
+		sidebarId = null;
+		sidebarWidgets = [];
+		wp.customize.each( function ( sidebarSetting, settingId ) {
+			var matches = settingId.match( /^sidebars_widgets\[(.+)\]/ );
+			if ( matches && self.registeredSidebars[ matches[1] ] && sidebarSetting().indexOf( setting.widgetId ) !== -1 ) {
+				if ( sidebarId ) {
+					// WARNING: widget exists in multiple sidebars
+					return;
+				}
+				sidebarId = matches[1];
+				sidebarWidgets = sidebarSetting();
+			}
+		} );
+		data = {
+			widget_id: setting.widgetId,
+			sidebar_id: sidebarId,
+			nonce: self.previewCustomizeNonce, // for Customize Preview
+			wp_customize: 'on'
+		};
+		if ( ! self.theme.active ) {
+			data.theme = self.theme.stylesheet;
+		}
+		data[ self.renderWidgetQueryVar ] = '1';
+		customized = {};
+		customized[ wp.customize.Widgets.sidebarIdToSettingId( sidebarId ) ] = sidebarWidgets;
+		customized[ setting.id ] = newInstance;
+		data.customized = JSON.stringify( customized );
+		data[ self.renderWidgetNoncePostKey ] = self.renderWidgetNonceValue;
+
+		// Allow plugins to prevent a partial refresh or to supply the data.sidebar_id
+		event = $.Event( 'widget-partial-refresh-request' );
+		$( document ).trigger( event, [ data ] );
+		if ( event.isDefaultPrevented() || ! data.sidebar_id ) {
+			self.preview.send( 'refresh' );
+			return;
+		}
+
+		$( '#' + setting.widgetId ).addClass( 'customize-partial-refreshing' );
+
+		$.post( self.requestUri, data, function ( r ) {
+			if ( ! r.success ) {
+				throw new Error( r.data && r.data.message ? r.data.message : 'FAIL' );
+			}
+			var oldWidget, newWidget, sidebarWidgets, position, beforeWidget, afterWidget, placementFailed = false;
+
+			// @todo Fire jQuery event to indicate that a widget was updated; here widgets can re-initialize them if they support live widgets
+			oldWidget = $( '#' + setting.widgetId );
+			newWidget = $( r.data.rendered_widget );
+			if ( newWidget.length && oldWidget.length ) {
+				oldWidget.replaceWith( newWidget );
+			} else if ( ! newWidget.length && oldWidget.length ) {
+				oldWidget.remove();
+			} else if ( newWidget.length && ! oldWidget.length ) {
+				sidebarWidgets = wp.customize( wp.customize.Widgets.sidebarIdToSettingId( r.data.sidebar_id ) )();
+				position = sidebarWidgets.indexOf( setting.widgetId );
+				if ( -1 === position ) {
+					throw new Error( 'Unable to determine new widget position in sidebar' );
+				}
+				if ( sidebarWidgets.length === 1 ) {
+					throw new Error( 'Unexpected postMessage for adding first widget to sidebar; refresh must be used instead.' );
+				}
+
+				if ( position > 0 ) {
+					beforeWidget = $( '#' + sidebarWidgets[ position - 1 ] );
+				}
+				if ( position <= 0 ) {
+					afterWidget = $( '#' + sidebarWidgets[ position + 1 ] );
+				}
+
+				if ( beforeWidget && beforeWidget.length ) {
+					beforeWidget.after( newWidget );
+				} else if ( afterWidget && afterWidget.length ) {
+					afterWidget.before( newWidget );
+				} else {
+					placementFailed = true;
+				}
+			}
+			self.preview.send( 'widget-updated', setting.widgetId );
+			wp.customize.trigger( 'sidebar-updated', sidebarId );
+			wp.customize.trigger( 'widget-updated', setting.widgetId );
+
+			if ( placementFailed ) {
+				self.preview.send( 'refresh' );
+			} else {
+				self.refreshTransports();
+				wp.customize.preview.send( 'update-control', {
+					id: setting.id, // the setting ID and the control ID are the same
+					active: 0 !== newWidget.length
+				} );
+			}
+		} );
+	};
 
 	return self;
 }( jQuery ));

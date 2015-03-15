@@ -3,8 +3,8 @@
 
 Refresh parts of a Customizer preview instead of reloading the entire page when a setting changed without transport=postMessage.
 
-**Contributors:** [xwp](http://profiles.wordpress.org/xwp), [westonruter](http://profiles.wordpress.org/westonruter)  
-**Tags:** [customizer](http://wordpress.org/plugins/tags/customizer), [customize](http://wordpress.org/plugins/tags/customize), [preview](http://wordpress.org/plugins/tags/preview)  
+**Contributors:** [xwp](https://profiles.wordpress.org/xwp), [westonruter](https://profiles.wordpress.org/westonruter)  
+**Tags:** [customizer](https://wordpress.org/plugins/tags/customizer), [customize](https://wordpress.org/plugins/tags/customize), [preview](https://wordpress.org/plugins/tags/preview)  
 **Requires at least:** 4.1  
 **Tested up to:** 4.1  
 **Stable tag:** trunk (master)  
@@ -44,24 +44,36 @@ in a future release.
 This plugin first focuses on resurrecting partial preview refreshes for widgets.
 We can then explore adding partial refresh support to other object types, such
 as menus, inline styles, or arbitrary regions registered.
-
 ### Usage ###
 To opt-in to partial preview refreshes for a theme, add:
 
-`add_theme_support( 'customize-partial-refresh-widgets' );`
+```php
+add_theme_support( 'customize-partial-refresh-widgets' );
+```
 
 When this is done, widgets in Core will automatically use partial refreshes.
 To opt-in to partial refreshes for other widget types, use this to opt-in for
 a specific widget:
 
-`add_filter( "customize_widget_partial_refreshable_{$id_base}", '__return_true' );`
+```php
+add_filter( "customize_widget_partial_refreshable_{$id_base}", '__return_true' );
+```
 
 And use this to opt-in everything:
 
-`add_filter( 'customize_widget_partial_refreshable', '__return_true' );`
+```php
+add_filter( 'customize_widget_partial_refreshable', '__return_true' );
+```
 
 
 ## Changelog ##
+
+### 0.2 ###
+* Fix partial refresh during theme preview ([PR #9](https://github.com/xwp/wp-customize-partial-refresh/pull/9))
+ * Eliminate remaining direct calls to parent window, use `postMessage` only ([PR #8](https://github.com/xwp/wp-customize-partial-refresh/pull/8))
+ * Allow inactive widgets to be rendered if sidebar is specified ([PR #10](https://github.com/xwp/wp-customize-partial-refresh/pull/10))
+ * Add initial support for plugins to support custom sidebars
+ * Various other fixes and hardening, see [0.1...0.2](https://github.com/xwp/wp-customize-partial-refresh/compare/0.1...0.2).
 
 ### 0.1 ###
 * Resurrect Widget Customizer partial refreshes.
