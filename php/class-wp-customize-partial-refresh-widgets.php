@@ -274,7 +274,7 @@ class WP_Customize_Partial_Refresh_Widgets {
 	 * @see dynamic_sidebar()
 	 * @action template_redirect
 	 */
-	static function render_widget() {
+	function render_widget() {
 		/**
 		 * @var WP_Customize_Manager $wp_customize
 		 */
@@ -356,6 +356,13 @@ class WP_Customize_Partial_Refresh_Widgets {
 			$params[0]['before_widget'] = sprintf( $params[0]['before_widget'], $widget_id, $class_name );
 			$params = apply_filters( 'dynamic_sidebar_params', $params );
 
+			$other_rendered_widget_ids = array();
+			add_action( 'dynamic_sidebar', function ( $widget ) use ( &$other_rendered_widget_ids, $widget_id ) {
+				if ( $widget_id !== $widget['id'] ) {
+					$other_rendered_widget_ids[] = $widget['id'];
+				}
+			} );
+
 			// Render the widget
 			ob_start();
 			do_action( 'dynamic_sidebar', $widget );
@@ -363,13 +370,15 @@ class WP_Customize_Partial_Refresh_Widgets {
 				call_user_func_array( $callback, $params );
 			}
 			$rendered_widget = ob_get_clean();
-			wp_send_json_success( compact( 'rendered_widget', 'sidebar_id' ) );
+			wp_send_json_success( compact( 'rendered_widget', 'sidebar_id', 'other_rendered_widget_ids' ) );
 		}
 		catch ( Exception $e ) {
 			if ( $e instanceof WP_Customize_Partial_Refresh_Exception && ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
 				$message = $e->getMessage();
 			} else {
-				error_log( sprintf( '%s in %s: %s', get_class( $e ), __FUNCTION__, $e->getMessage() ) );
+				if ( ! ( defined( '\WPCOM_IS_VIP_ENV' ) && \WPCOM_IS_VIP_ENV ) ) {
+					trigger_error( esc_html( sprintf( '%s in %s: %s', get_class( $e ), __FUNCTION__, $e->getMessage() ) ), E_USER_WARNING );
+				}
 				$message = $generic_error;
 			}
 			wp_send_json_error( compact( 'message' ) );
